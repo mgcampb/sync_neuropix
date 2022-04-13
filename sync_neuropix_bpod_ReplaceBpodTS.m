@@ -6,6 +6,11 @@
 % Added linfit/quadfit synchronization to get whole session
 % MGC 3/23/2022
 
+% New sync approach:
+% Just replace Bpod trial start time stamps with Imec's
+% (Simpler, and we keep spikes for the whole session)
+% (Drift should be minimal within a trial)
+
 %% options
 tic
 opt = struct;
@@ -17,9 +22,13 @@ opt.run_name = {opt.run_name.name}';
 for i = 1:numel(opt.run_name)
     opt.run_name{i} = opt.run_name{i}(1:end-4);
 end
-opt.run_name = opt.run_name(contains(opt.run_name,'MC25'));
 
-opt.sync_type = 'linfit'; % 'linfit' or 'quadfit'
+keep = ~strcmp(opt.run_name,'MC34_20220110');
+opt.run_name = opt.run_name(keep);
+
+opt.nidaq_tbin = 0.001; % in seconds
+opt.nidaq_ch = [2]; % which nidaq channels to keep
+opt.nidaq_name = {'velocity'}; % names for the above channels
 
 % % experimental parameters (useful to save here)
 % exp_params = struct;
@@ -49,7 +58,7 @@ for sesh_idx = 1:numel(opt.run_name)
     exp_params = dat_orig.exp_params;
 
     % paths
-    opt.save_dir = ['I:\My Drive\UchidaLab\DA_independence\neuropix_processed\' opt.sync_type]; % where to save processed data
+    opt.save_dir = 'I:\My Drive\UchidaLab\DA_independence\neuropix_processed\replace_bpod_ts'; % where to save processed data
     opt.save_name = run_name; % file to save processed data to
     opt.ecephys_dir = ['F:\ecephys\catGT\catgt_' run_name '_g0\'];
     opt.ks_dir = [opt.ecephys_dir run_name '_g0_imec0\imec0_ks3'];
@@ -80,8 +89,21 @@ for sesh_idx = 1:numel(opt.run_name)
         end
     end
     assert(corr(diff(ts_bpod),diff(ts_imec))>0.95);
-    
+
+    % New sync approach: Just replace Bpod trial start timestamps with Imec's
+    % (Drift should be minimal within a trial)
+    trial_diff = SessionData.TrialEndTimestamp - SessionData.TrialStartTimestamp;
+    SessionData.TrialStartTimestamp = ts_imec';
+    SessionData.TrialEndTimestamp = ts_imec' + trial_diff;
+
+    %% Old sync approach: Sync spike times to Bpod
+    % sp.st_uncorrected = sp.st; % save original spike times
+
+    % % interp1. Add 10 seconds to last ts to get the last trial.   
+    % sp.st = interp1([ts_imec; ts_imec(end)+10],[ts_bpod; ts_bpod(end)+10],sp.st_uncorrected); 
+
     %% load NIDAQ data
+    NidaqData = [];
     ni_bin = dir(fullfile(opt.ni_dir,'*.bin'));
 
     if ~isempty(ni_bin)
@@ -111,42 +133,22 @@ for sesh_idx = 1:numel(opt.run_name)
             end
         end
         assert(corr(diff(ts_ni),diff(ts_imec))>0.95);
-    end
 
-    %% Sync spike times to Bpod
-    sp.st_uncorrected = sp.st; % save original spike times
+        % sync to Imec
+        fit = polyfit(ts_ni,ts_imec,1); % linear fit
+        daq_time_transf = daq_time * fit(1) + fit(2);
+        daqt = min(daq_time_transf):opt.nidaq_tbin:max(daq_time_transf);
 
-    % Old way: interp1. Add 10 seconds to last ts to get the last trial.   
-    sp.st_interp = interp1([ts_imec; ts_imec(end)+10],[ts_bpod; ts_bpod(end)+10],sp.st_uncorrected); 
+        NidaqData = struct;
+        NidaqData.daqt = daqt;
+        NidaqData.data = nan(numel(opt.nidaq_ch),numel(daqt));
+        for daq_ch = 1:numel(opt.nidaq_ch)
+            NidaqData.data(daq_ch,:) = interp1(daq_time_transf,double(daq_data(opt.nidaq_ch(daq_ch),:)),daqt);
+        end
+        NidaqData.name = opt.nidaq_name;
+    end 
 
-    % New way: quadratic fit. Gets the whole session, including parts with no sync pulses.
-    if strcmp(opt.sync_type,'linfit')
-        fit = polyfit(ts_imec,ts_bpod,1); 
-        sp.st = sp.st_uncorrected * fit(1) + fit(2);
-    elseif strcmp(opt.sync_type,'quadfit')
-        fit = polyfit(ts_imec,ts_bpod,2); 
-        sp.st = sp.st_uncorrected.^2 * fit(1) + sp.st_uncorrected * fit(2) + fit(3);
-    end
-
-    keyboard;
-
-    %% Sync NIDAQ data to Bpod: Velocity
-
-    if ~isempty(ni_bin)
-        % get velocity
-        velt_orig = 0:0.001:max(daq_time); % 1ms time bins
-        vel_orig = interp1(daq_time,double(daq_data(2,:)),velt_orig);  
     
-        fit = polyfit(ts_ni,ts_bpod,2); % quadratic fit
-        velt_transf = velt_orig.^2 * fit(1) + velt_orig * fit(2) + fit(3);
-        velt = min(velt_transf):0.001:max(velt_transf);
-        vel = interp1(velt_transf,vel_orig,velt);
-        
-        % % lightly smooth velocity
-        % win = gausswin(50); % 50 ms gaussian window (not sure of exact SD)
-        % win = win/sum(win);
-        % vel = conv(vel,win,"same");
-    end
 
     %% Remove unnecessary data
     sp = rmfield(sp,'spikeTemplates');
@@ -160,59 +162,13 @@ for sesh_idx = 1:numel(opt.run_name)
     sp.mean_waveforms = dat_orig.sp.mean_waveforms;
     sp.metrics = dat_orig.sp.metrics;
 
-    %% load additional information about units: QC metrics, waveform metrics, channel map
-    
-    % sp.chan_map = readNPY(fullfile(opt.ks_dir,'channel_map.npy'));
-    % sp.waveform_metrics = readtable(fullfile(opt.ks_dir,'waveform_metrics.csv'));
-    % sp.waveform_metrics = sp.waveform_metrics(:,2:end);
-    % sp.qc_metrics = readtable(fullfile(opt.ks_dir,'metrics.csv'));
-    % sp.qc_metrics = sp.qc_metrics(:,2:end);
-    % sp.mean_waveforms = readNPY(fullfile(opt.ks_dir,'mean_waveforms.npy'));
-    % 
-    % % select cells that were manually labeled
-    % idx = nan(size(sp.cgs));
-    % for i = 1:numel(idx)
-    %     idx_this = find(sp.qc_metrics.cluster_id==sp.cids(i));
-    %     if ~isempty(idx_this)
-    %         idx(i) = idx_this;
-    %     end
-    % end
-    % idx = idx(~isnan(idx));
-    % sp.waveform_metrics = sp.waveform_metrics(idx,:);
-    % sp.qc_metrics = sp.qc_metrics(idx,:);
-    % sp.mean_waveforms = sp.mean_waveforms(sp.cids(ismember(sp.cids,sp.qc_metrics.cluster_id))+1,:,:);
-    % sp.mean_waveforms_cluster_id = sp.cids(ismember(sp.cids,sp.qc_metrics.cluster_id));
-
-    %% remove double-counted spikes
-    % Not necessary - already none - MGC 11/9/2021
-
-    % fprintf('removing double-counted spikes...\n');
-    % good_cells = sp.cids(sp.cgs==2);
-    % st_orig = sp.st(ismember(sp.clu,good_cells));
-    % clu_orig = sp.clu(ismember(sp.clu,good_cells));
-    % 
-    % st_uniq = [];
-    % clu_uniq = [];
-    % for i = 1:numel(good_cells)
-    %     st_this = unique(st_orig(clu_orig==good_cells(i)));
-    %     st_uniq = [st_uniq; st_this];
-    %     clu_uniq = [clu_uniq; good_cells(i)*ones(numel(st_this),1)];
-    % end
-    % 
-    % [st_uniq,sort_idx] = sort(st_uniq);
-    % clu_uniq = clu_uniq(sort_idx);
-    % sp.st_uniq = st_uniq;
-    % sp.clu_uniq = clu_uniq;
-    % 
-    % fprintf('\t removed %d double-counted spikes\n',numel(st_orig)-numel(st_uniq));
-
     %% save processed data
     fprintf('saving processed data...\n');
     if exist(opt.save_dir,'dir')~=7
         mkdir(opt.save_dir);
     end
     save(fullfile(opt.save_dir,opt.save_name),...
-        'sp','SessionData','exp_params','velt','vel');
+        'sp','SessionData','exp_params','NidaqData');
     fprintf('done.\n');
     toc
 end
